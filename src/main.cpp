@@ -1,9 +1,10 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <Adafruit_NeoPixel.h>
+#include <Adafruit_seesaw.h>
 #include <ArduinoJson.h>
 #include "sequences.h"
 
-// Debug macros - only print when DEBUG is defined
 #ifdef DEBUG
   #define DEBUG_PRINT(x) Serial.print(x)
   #define DEBUG_PRINTLN(x) Serial.println(x)
@@ -16,295 +17,283 @@
 
 // Hardware configuration
 #define LED_PIN 2        // D1 (GPIO2) - NeoPixels
-#define BUTTON_PIN 1     // D0 (GPIO1) - Button
+#define BUTTON_PIN 1     // D0 (GPIO1) - Physical button
 #define NUM_LEDS 21
-
-// Grid configuration: 7 columns (A-G) × 3 rows (1-3)
 #define GRID_COLS 7
 #define GRID_ROWS 3
+
+// I2C pins — adjust if your wiring differs
+#define I2C_SDA 5   // XIAO ESP32-S3 D4 / GPIO5
+#define I2C_SCL 6   // XIAO ESP32-S3 D5 / GPIO6
+
+// Rotary encoder (Adafruit I2C STEMMA QT)
+#define ENCODER_ADDR 0x36
+#define ENCODER_SWITCH 24
 
 // NeoPixel strip
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-// Button state - RTOS based with task debouncing
+// Rotary encoder
+Adafruit_seesaw encoder;
+bool encoderFound = false;
+int32_t encoderPosition = 0;
+
+// Encoder button debounce
+bool lastEncoderBtnState = true;
+unsigned long lastEncoderBtnTime = 0;
+const unsigned long encoderBtnDebounceMs = 200;
+
+// Physical button — RTOS-based debouncing
 QueueHandle_t buttonQueue;
-volatile bool buttonPressedFlag = false;  // Flag set by ISR
-const unsigned long debounceDelay = 50;   // 50ms debounce delay
+volatile bool buttonPressedFlag = false;
+const unsigned long debounceDelay = 50;
 
-// Sequence state
-DynamicJsonDocument doc(4096);  // 4KB buffer for JSON
-JsonArray sequences;
-int currentSequenceIndex = -1;  // Start at -1 for blank state
-int totalSequences = 0;
+// Application state machine
+enum AppState { SELECTING, PLAYER_SELECT, SEQUENCE_RUNNING };
+AppState appState = SELECTING;
 
-// Parse hex color code (e.g., "#FFFFFF" or "0xFFFFFF") to RGB
+// Game selection
+int currentGameIndex = 0;
+
+// Player/selector selection
+int currentSelectorIndex = 0;
+int32_t selectorEncoderBase = 0;  // encoder position when entering PLAYER_SELECT
+
+// Sequence playback
+DynamicJsonDocument gameDoc(8192);
+JsonArray gameFrames;
+int currentFrameIndex = 0;
+int totalFrames = 0;
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
+
 uint32_t parseHexColor(const char* hexColor) {
-    // Handle "#RRGGBB" format
-    if (hexColor[0] == '#') {
-        hexColor++;  // Skip the '#'
-    }
-    // Handle "0x" prefix
-    else if (hexColor[0] == '0' && (hexColor[1] == 'x' || hexColor[1] == 'X')) {
-        hexColor += 2;  // Skip "0x"
-    }
-    
-    // Parse the hex string
-    uint32_t color = strtoul(hexColor, NULL, 16);
-    return color;
+    if (hexColor[0] == '#') hexColor++;
+    else if (hexColor[0] == '0' && (hexColor[1] == 'x' || hexColor[1] == 'X')) hexColor += 2;
+    return strtoul(hexColor, NULL, 16);
 }
 
-// Extract RGB components from 24-bit color value
 void colorToRGB(uint32_t color, uint8_t &r, uint8_t &g, uint8_t &b) {
     r = (color >> 16) & 0xFF;
     g = (color >> 8) & 0xFF;
     b = color & 0xFF;
 }
 
-// Convert grid coordinate (e.g., "A1", "B2", "G3") to LED index
 int gridToIndex(const char* gridPos) {
     if (strlen(gridPos) < 2) return -1;
-    
-    char col = gridPos[0];
-    char row = gridPos[1];
-    
-    // Column: A=0, B=1, ..., G=6
-    int colIndex = toupper(col) - 'A';
-    // Row: 1=0, 2=1, 3=2
-    int rowIndex = row - '1';
-    
-    // Validate
+    int colIndex = toupper(gridPos[0]) - 'A';
+    int rowIndex = gridPos[1] - '1';
     if (colIndex < 0 || colIndex >= GRID_COLS) return -1;
     if (rowIndex < 0 || rowIndex >= GRID_ROWS) return -1;
-    
-    // Calculate linear index (row-major order)
     return rowIndex * GRID_COLS + colIndex;
 }
 
-// Load sequences from configuration file
-bool loadSequences() {
-    DEBUG_PRINTLN("Parsing JSON configuration from sequences.h...");
-    
-    DeserializationError error = deserializeJson(doc, SEQUENCES_JSON);
-    
-    if (error) {
-        DEBUG_PRINT("ERROR: Failed to parse JSON: ");
-        DEBUG_PRINTLN(error.c_str());
-        return false;
-    }
-    
-    sequences = doc.as<JsonArray>();
-    totalSequences = sequences.size();
-    
-    DEBUG_PRINT("SUCCESS: Loaded ");
-    DEBUG_PRINT(totalSequences);
-    DEBUG_PRINTLN(" sequences from sequences.h");
-    
-    return true;
+int computeWrappedIndex(int32_t position, int count) {
+    int idx = (int)(position % count);
+    if (idx < 0) idx += count;
+    return idx;
 }
 
-// Display a specific sequence
-void displaySequence(int index) {
-    DEBUG_PRINT("\n=== displaySequence called with index ");
-    DEBUG_PRINT(index);
-    DEBUG_PRINT(" (totalSequences=");
-    DEBUG_PRINT(totalSequences);
-    DEBUG_PRINTLN(") ===");
-    
-    if (index < 0 || index >= totalSequences) {
-        DEBUG_PRINTLN("ERROR: Index out of range!");
-        return;
+// ---------------------------------------------------------------------------
+// Encoder helpers
+// ---------------------------------------------------------------------------
+
+bool readEncoderButton() {
+    if (!encoderFound) return false;
+    bool currentState = encoder.digitalRead(ENCODER_SWITCH);
+    bool pressed = false;
+
+    if (!currentState && lastEncoderBtnState &&
+        (millis() - lastEncoderBtnTime > encoderBtnDebounceMs)) {
+        pressed = true;
+        lastEncoderBtnTime = millis();
     }
-    
-    // Clear all LEDs first
-    strip.clear();
-    DEBUG_PRINTLN("LEDs cleared");
-    
-    // Get the sequence object
-    JsonObject sequence = sequences[index];
-    
-    DEBUG_PRINT("Displaying sequence ");
-    DEBUG_PRINT(index + 1);
-    DEBUG_PRINT("/");
-    DEBUG_PRINTLN(totalSequences);
-    
-    // Iterate through each grid position in the sequence
-    for (JsonPair kv : sequence) {
-        const char* gridPos = kv.key().c_str();
-        JsonVariant colorValue = kv.value();
-        
-        int ledIndex = gridToIndex(gridPos);
-        
-        if (ledIndex >= 0 && ledIndex < NUM_LEDS) {
-            uint8_t r, g, b;
-            
-            // Check if color is a hex string or RGB array
-            if (colorValue.is<const char*>()) {
-                // Hex color string (e.g., "#FFFFFF")
-                const char* hexColor = colorValue.as<const char*>();
-                uint32_t color = parseHexColor(hexColor);
-                colorToRGB(color, r, g, b);
-                
-                DEBUG_PRINT("  ");
-                DEBUG_PRINT(gridPos);
-                DEBUG_PRINT(" -> LED ");
-                DEBUG_PRINT(ledIndex);
-                DEBUG_PRINT(" = ");
-                DEBUG_PRINT(hexColor);
-                DEBUG_PRINT(" RGB(");
-                DEBUG_PRINT(r);
-                DEBUG_PRINT(",");
-                DEBUG_PRINT(g);
-                DEBUG_PRINT(",");
-                DEBUG_PRINT(b);
-                DEBUG_PRINTLN(")");
-            } 
-            else if (colorValue.is<JsonArray>()) {
-                // RGB array format (backward compatibility)
-                JsonArray colorArray = colorValue.as<JsonArray>();
-                if (colorArray.size() >= 3) {
-                    r = colorArray[0];
-                    g = colorArray[1];
-                    b = colorArray[2];
-                    
-                    DEBUG_PRINT("  ");
-                    DEBUG_PRINT(gridPos);
-                    DEBUG_PRINT(" -> LED ");
-                    DEBUG_PRINT(ledIndex);
-                    DEBUG_PRINT(" = RGB(");
-                    DEBUG_PRINT(r);
-                    DEBUG_PRINT(",");
-                    DEBUG_PRINT(g);
-                    DEBUG_PRINT(",");
-                    DEBUG_PRINT(b);
-                    DEBUG_PRINTLN(")");
-                } else {
-                    DEBUG_PRINT("  WARNING: Invalid RGB array for ");
-                    DEBUG_PRINTLN(gridPos);
-                    continue;
-                }
-            } else {
-                DEBUG_PRINT("  WARNING: Invalid color format for ");
-                DEBUG_PRINTLN(gridPos);
-                continue;
-            }
-            
-            strip.setPixelColor(ledIndex, strip.Color(r, g, b));
-        } else {
-            DEBUG_PRINT("  WARNING: Invalid LED index for ");
-            DEBUG_PRINTLN(gridPos);
-        }
-    }
-    
-    DEBUG_PRINTLN("Calling strip.show()...");
-    strip.show();
-    DEBUG_PRINTLN("Sequence displayed!\n");
+    lastEncoderBtnState = currentState;
+    return pressed;
 }
 
-// ISR handler for button press - just set flag
+// ---------------------------------------------------------------------------
+// Physical button — ISR + FreeRTOS debounce task
+// ---------------------------------------------------------------------------
+
 void IRAM_ATTR buttonISR() {
-    // Set flag for debounce task to handle
     buttonPressedFlag = true;
 }
 
-// FreeRTOS task for button debouncing
 void buttonDebounceTask(void *parameter) {
     bool lastState = HIGH;
-    
+
     while (true) {
-        // Check if ISR flagged a button event
         if (buttonPressedFlag) {
             buttonPressedFlag = false;
-            
-            // Wait for debounce delay
             vTaskDelay(pdMS_TO_TICKS(debounceDelay));
-            
-            // Read stable state after debounce
+
             bool currentState = digitalRead(BUTTON_PIN);
-            
-            // Only trigger on LOW to HIGH transition (button release)
+
             if (lastState == LOW && currentState == HIGH) {
-                DEBUG_PRINTLN("\n=== Button Released (Debounced) ===");
-                
-                // Send event to queue
-                uint8_t buttonEvent = 1;
-                xQueueSend(buttonQueue, &buttonEvent, 0);
+                DEBUG_PRINTLN("Button released (debounced)");
+                uint8_t evt = 1;
+                xQueueSend(buttonQueue, &evt, 0);
             }
-            
             lastState = currentState;
         }
-        
-        // Small delay to prevent task hogging CPU
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-// Handle button events from queue
-void handleButtonPress() {
-    // Move to next sequence
-    currentSequenceIndex++;
-    
-    // Check if we've gone past the last sequence
-    if (currentSequenceIndex >= totalSequences) {
-        // Show blank (all LEDs off) and reset to -1
-        strip.clear();
-        strip.show();
-        currentSequenceIndex = -1;
-        DEBUG_PRINTLN("Displaying blank state (end of sequences)");
-    } else {
-        // Display the current sequence
-        displaySequence(currentSequenceIndex);
+// ---------------------------------------------------------------------------
+// Display helpers
+// ---------------------------------------------------------------------------
+
+void displayFrame(JsonObject frame) {
+    strip.clear();
+    for (JsonPair kv : frame) {
+        const char* gridPos = kv.key().c_str();
+        JsonVariant colorValue = kv.value();
+        int ledIndex = gridToIndex(gridPos);
+        if (ledIndex < 0 || ledIndex >= NUM_LEDS) continue;
+
+        uint8_t r, g, b;
+        if (colorValue.is<const char*>()) {
+            uint32_t color = parseHexColor(colorValue.as<const char*>());
+            colorToRGB(color, r, g, b);
+        } else if (colorValue.is<JsonArray>()) {
+            JsonArray arr = colorValue.as<JsonArray>();
+            if (arr.size() < 3) continue;
+            r = arr[0]; g = arr[1]; b = arr[2];
+        } else {
+            continue;
+        }
+        strip.setPixelColor(ledIndex, strip.Color(r, g, b));
+    }
+    strip.show();
+}
+
+void showGameIndicator(int gameIndex) {
+    strip.clear();
+    if (gameIndex >= 0 && gameIndex < NUM_GAMES) {
+        int ledIndex = gridToIndex(GAMES[gameIndex].gridPos);
+        if (ledIndex >= 0) {
+            strip.setPixelColor(ledIndex, strip.Color(255, 255, 255));
+        }
+    }
+    strip.show();
+}
+
+void showSelectorIndicator(int gameIndex, int selectorIndex) {
+    const GameDef& game = GAMES[gameIndex];
+    if (selectorIndex < 0 || selectorIndex >= game.numSelectors) return;
+
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, game.selectors[selectorIndex].indicator);
+    if (error) return;
+    displayFrame(doc.as<JsonObject>());
+}
+
+bool loadSequence(const char* sequenceJson) {
+    gameDoc.clear();
+    DeserializationError error = deserializeJson(gameDoc, sequenceJson);
+    if (error) {
+        DEBUG_PRINT("Failed to parse sequence: ");
+        DEBUG_PRINTLN(error.c_str());
+        return false;
+    }
+
+    gameFrames = gameDoc.as<JsonArray>();
+    totalFrames = gameFrames.size();
+    currentFrameIndex = 0;
+    return totalFrames > 0;
+}
+
+// ---------------------------------------------------------------------------
+// State transitions
+// ---------------------------------------------------------------------------
+
+void enterPlayerSelect() {
+    appState = PLAYER_SELECT;
+    currentSelectorIndex = 0;
+    selectorEncoderBase = encoderPosition;
+    showSelectorIndicator(currentGameIndex, currentSelectorIndex);
+    DEBUG_PRINT("PLAYER_SELECT for game ");
+    DEBUG_PRINTLN(GAMES[currentGameIndex].gridPos);
+}
+
+void enterSequenceRunning() {
+    const SelectorDef& sel = GAMES[currentGameIndex].selectors[currentSelectorIndex];
+    if (loadSequence(sel.sequence)) {
+        appState = SEQUENCE_RUNNING;
+        displayFrame(gameFrames[0].as<JsonObject>());
+        DEBUG_PRINT("SEQUENCE_RUNNING: selector ");
+        DEBUG_PRINTLN(currentSelectorIndex);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
 
 void setup() {
     #ifdef DEBUG
     Serial.begin(115200);
     delay(2000);
     #endif
-    
-    DEBUG_PRINTLN("\n=== LED Sequence Controller (RTOS) ===");
-    
-    // Create queue for button events (queue size of 5)
+
+    DEBUG_PRINTLN("\n=== Bureaucracy Board ===");
+
+    // Physical button setup (RTOS)
     buttonQueue = xQueueCreate(5, sizeof(uint8_t));
     if (buttonQueue == NULL) {
         DEBUG_PRINTLN("ERROR: Failed to create button queue!");
-    } else {
-        DEBUG_PRINTLN("Button queue created successfully");
     }
-    
-    // Initialize button with pull-up
+
     pinMode(BUTTON_PIN, INPUT_PULLUP);
-    
-    // Create button debounce task
+
     xTaskCreate(
-        buttonDebounceTask,   // Task function
-        "ButtonDebounce",     // Task name
-        2048,                 // Stack size
-        NULL,                 // Parameters
-        1,                    // Priority
-        NULL                  // Task handle
+        buttonDebounceTask,
+        "ButtonDebounce",
+        2048,
+        NULL,
+        1,
+        NULL
     );
-    DEBUG_PRINTLN("Button debounce task created");
-    
-    // Attach interrupt to button pin (trigger on any change)
     attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, CHANGE);
-    DEBUG_PRINTLN("Button interrupt attached (CHANGE -> debounce task)");
-    
-    // Initialize NeoPixel strip
+    DEBUG_PRINTLN("Physical button initialized");
+
+    // NeoPixels
     strip.begin();
     strip.setBrightness(255);
     strip.clear();
     strip.show();
     DEBUG_PRINTLN("NeoPixels initialized");
-    
-    // Load sequences from embedded JSON
-    if (loadSequences()) {
-        DEBUG_PRINTLN("Ready! All LEDs off. Press button to start first sequence.");
-        // Start with blank state (currentSequenceIndex is already -1)
-        // Don't display anything - LEDs are already cleared above
+
+    // I2C rotary encoder
+    Wire.begin(I2C_SDA, I2C_SCL);
+    delay(100);
+
+    #ifdef DEBUG
+    DEBUG_PRINTLN("Scanning I2C bus...");
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            DEBUG_PRINT("  Found device at 0x");
+            DEBUG_PRINTLN(String(addr, HEX));
+        }
+    }
+    #endif
+
+    if (encoder.begin(ENCODER_ADDR)) {
+        encoderFound = true;
+        encoder.pinMode(ENCODER_SWITCH, INPUT_PULLUP);
+        encoderPosition = encoder.getEncoderPosition();
+        currentGameIndex = computeWrappedIndex(encoderPosition, NUM_GAMES);
+        showGameIndicator(currentGameIndex);
+        DEBUG_PRINT("Encoder OK — selecting game ");
+        DEBUG_PRINTLN(GAMES[currentGameIndex].gridPos);
     } else {
-        DEBUG_PRINTLN("ERROR: Could not load sequences!");
-        // Show error pattern (red blink on first LED)
+        DEBUG_PRINTLN("ERROR: Rotary encoder not found at 0x36!");
+        DEBUG_PRINTLN("Check wiring: SDA->D4(GPIO5), SCL->D5(GPIO6)");
         for (int i = 0; i < 5; i++) {
             strip.setPixelColor(0, strip.Color(255, 0, 0));
             strip.show();
@@ -316,16 +305,85 @@ void setup() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
 void loop() {
-    // Wait for button events from the queue
-    uint8_t buttonEvent;
-    
-    // Block waiting for button press (with 10ms timeout to keep watchdog happy)
-    if (xQueueReceive(buttonQueue, &buttonEvent, pdMS_TO_TICKS(10)) == pdTRUE) {
-        // Button event received!
-        handleButtonPress();
+    // --- Read encoder inputs ---
+    bool encoderTurned = false;
+    bool encoderBtnPressed = false;
+
+    if (encoderFound) {
+        int32_t newPosition = encoder.getEncoderPosition();
+        encoderTurned = (newPosition != encoderPosition);
+        if (encoderTurned) encoderPosition = newPosition;
+        encoderBtnPressed = readEncoderButton();
     }
-    
-    // Small yield to other RTOS tasks
+
+    // --- Read physical button ---
+    uint8_t buttonEvent;
+    bool physicalBtnPressed = (xQueueReceive(buttonQueue, &buttonEvent, 0) == pdTRUE);
+
+    // ===================== SELECTING =====================
+    // Encoder turn: cycle games (white LED). Encoder press: confirm → PLAYER_SELECT.
+    if (appState == SELECTING) {
+
+        if (encoderTurned) {
+            int newIdx = computeWrappedIndex(encoderPosition, NUM_GAMES);
+            if (newIdx != currentGameIndex) {
+                currentGameIndex = newIdx;
+                DEBUG_PRINT("Game: ");
+                DEBUG_PRINTLN(GAMES[currentGameIndex].gridPos);
+            }
+            showGameIndicator(currentGameIndex);
+        }
+
+        if (encoderBtnPressed) {
+            enterPlayerSelect();
+        }
+    }
+
+    // ===================== PLAYER_SELECT =====================
+    // Encoder turn: cycle selectors (indicator LEDs). Encoder press: confirm → SEQUENCE_RUNNING.
+    else if (appState == PLAYER_SELECT) {
+        int numSelectors = GAMES[currentGameIndex].numSelectors;
+
+        if (encoderTurned) {
+            int32_t delta = encoderPosition - selectorEncoderBase;
+            int newIdx = computeWrappedIndex(delta, numSelectors);
+            if (newIdx != currentSelectorIndex) {
+                currentSelectorIndex = newIdx;
+                showSelectorIndicator(currentGameIndex, currentSelectorIndex);
+                DEBUG_PRINT("Selector: ");
+                DEBUG_PRINTLN(currentSelectorIndex);
+            }
+        }
+
+        if (encoderBtnPressed) {
+            enterSequenceRunning();
+        }
+    }
+
+    // ===================== SEQUENCE_RUNNING =====================
+    // Physical button: advance frame. After last frame → back to PLAYER_SELECT.
+    else if (appState == SEQUENCE_RUNNING) {
+
+        if (physicalBtnPressed && totalFrames > 0) {
+            currentFrameIndex++;
+
+            if (currentFrameIndex >= totalFrames) {
+                DEBUG_PRINTLN("Sequence complete → PLAYER_SELECT");
+                enterPlayerSelect();
+            } else {
+                DEBUG_PRINT("Frame ");
+                DEBUG_PRINT(currentFrameIndex + 1);
+                DEBUG_PRINT("/");
+                DEBUG_PRINTLN(totalFrames);
+                displayFrame(gameFrames[currentFrameIndex].as<JsonObject>());
+            }
+        }
+    }
+
     vTaskDelay(pdMS_TO_TICKS(1));
 }
